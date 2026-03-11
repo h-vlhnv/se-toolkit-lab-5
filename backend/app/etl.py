@@ -1,7 +1,7 @@
 """ETL pipeline: fetch data from the autochecker API and load it into the database.
 
 The autochecker dashboard API provides two endpoints:
-- GET /api/items — lab/task catalog
+- GET /api/items — lab/task catalog (currently unavailable, items extracted from logs)
 - GET /api/logs  — anonymized check results (supports ?since= and ?limit= params)
 
 Both require HTTP Basic Auth (email + password from settings).
@@ -29,13 +29,59 @@ def _auth() -> httpx.BasicAuth:
 
 
 async def fetch_items() -> list[dict]:
-    """Fetch the lab/task catalog from the autochecker API."""
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(
-            f"{settings.autochecker_api_url}/api/items", auth=_auth()
-        )
-        resp.raise_for_status()
-        return resp.json()
+    """Fetch the lab/task catalog from the autochecker API.
+    
+    Note: The /api/items endpoint is currently unavailable on the server.
+    Items are now extracted from logs in extract_items_from_logs().
+    
+    This function is kept for backward compatibility but returns empty list.
+    """
+    # The /api/items endpoint returns 500 on the server side
+    # Items will be extracted from logs instead
+    return []
+
+
+def extract_items_from_logs(logs: list[dict]) -> list[dict]:
+    """Extract unique items (labs and tasks) from log entries.
+    
+    Args:
+        logs: List of log dicts from the API
+        
+    Returns:
+        List of item dicts with keys: lab, task (optional), title, type
+    """
+    items_map: dict[tuple[str, str | None], dict] = {}
+    
+    for log in logs:
+        lab_id = log["lab"]
+        task_id = log.get("task")  # None for lab-level entries
+        
+        # Add lab item
+        lab_key = (lab_id, None)
+        if lab_key not in items_map:
+            # Generate a human-readable title from lab_id (e.g., "lab-01" -> "Lab 01")
+            lab_title = lab_id.replace("-", " ").title()
+            items_map[lab_key] = {
+                "lab": lab_id,
+                "task": None,
+                "title": lab_title,
+                "type": "lab",
+            }
+        
+        # Add task item if present
+        if task_id:
+            task_key = (lab_id, task_id)
+            if task_key not in items_map:
+                # Generate title from task_id (e.g., "task-0" -> "Task 0")
+                task_title = task_id.replace("-", " ").title()
+                items_map[task_key] = {
+                    "lab": lab_id,
+                    "task": task_id,
+                    "title": task_title,
+                    "type": "task",
+                }
+    
+    return list(items_map.values())
 
 
 async def fetch_logs(since: datetime | None = None) -> list[dict]:
@@ -194,16 +240,31 @@ async def load_logs(
 
 async def sync(session: AsyncSession) -> dict:
     """Run the full ETL pipeline and return a summary."""
-    items_catalog = await fetch_items()
-    await load_items(items_catalog, session)
-
+    # Step 1: Determine the last synced timestamp
     last_ts = (
         await session.exec(select(func.max(InteractionLog.created_at)))
     ).first()
 
+    # Step 2: Fetch logs (all or incremental)
     logs = await fetch_logs(since=last_ts)
+    
+    if not logs:
+        # No new logs, return current count
+        total_records = (
+            await session.exec(select(func.count(InteractionLog.id)))
+        ).first() or 0
+        return {"new_records": 0, "total_records": total_records}
+
+    # Step 3: Extract items from logs
+    items_catalog = extract_items_from_logs(logs)
+    
+    # Step 4: Load items into the database
+    await load_items(items_catalog, session)
+
+    # Step 5: Load logs into the database
     new_records = await load_logs(logs, items_catalog, session)
 
+    # Step 6: Get total records count
     total_records = (
         await session.exec(select(func.count(InteractionLog.id)))
     ).first() or 0
